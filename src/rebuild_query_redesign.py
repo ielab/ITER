@@ -1,7 +1,7 @@
 """Rebuild the training queries in the redesigned structured format.
 
 Replays the 4 dedup trajectory sources and re-emits the training data as
-i0..i5 in the new query format (docs/query_input_redesign.md), reusing the
+every query style (docs/query_representations.md), reusing the
 pos/neg of the existing v1 file — the LLM judge is NOT re-run.
 
 Sample identity is recovered without relying on file order: for every replay
@@ -11,8 +11,12 @@ v1 lines. Every v1 line must be claimed exactly once; candidates the judge had
 rejected simply find no line.
 
 Run from the repo root:
-    python src/rebuild_query_redesign.py
+    python src/rebuild_query_redesign.py \
+        --v1 train_data/training_data_v1.jsonl \
+        --traj-dir runs/dedup_traj \
+        --out train_data/redesign
 """
+import argparse
 import json
 import multiprocessing
 import os
@@ -31,24 +35,22 @@ from data_builder import (
     load_all_trajectories,
     load_corpus_jsonl,
 )
-from memory_utils import build_memory_query, build_redesign_query
+from config import COLLECTION_BACKENDS
+from memory_utils import REDESIGN_INSTRUCTIONS, build_memory_query, build_redesign_query
 
-ROOT = "/scratch/user/uqdche12/ITER"
-V1_PATH = f"{ROOT}/experiments/traj-aware/training_data/training_data_v1.jsonl"
-# the EXACT dirs the original build ran on (datasets/lrat-train/trajectories is
-# a different, larger copy -- its extra trajs have no lines in the v1 file)
-TRAJ_BASE = f"{ROOT}/runs/dedup_traj_true"
-CORPUS_PATH = f"{ROOT}/data/corpus.jsonl"
-OUT_DIR = f"{ROOT}/train_data/redesign"
-SOURCES = ["bm25", "qwen3-0.6b", "qwen3-4b", "qwen3-8b"]
-VARIANTS = ["i0", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10"]
+ROOT = os.environ.get("ITER_ROOT", os.getcwd())
+
+# Set from the command line in main(); the worker pool is forked afterwards and
+# inherits them, which is why they live at module level.
+V1_PATH = TRAJ_BASE = CORPUS_PATH = OUT_DIR = None
+SOURCES = VARIANTS = None
 
 _CORPUS = {}
 _TOK = None
 
 
 def _reasoning_before(steps, i):
-    """Pre-search reasoning (i8/i9): consecutive reasoning steps right before
+    """Pre-search reasoning (i6/i7): consecutive reasoning steps right before
     the search call = the issuing turn's <think>. Joined with " " exactly like
     react_agent's set_current_thinking; a search preceded by another tool_call
     (parallel calls) gets "" -> rendered as "Empty"."""
@@ -153,7 +155,32 @@ def _init_worker():
     _TOK = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
 
 
+def parse_args():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--v1", default=f"{ROOT}/train_data/training_data_v1.jsonl",
+                    help="the training groups from data_builder.py")
+    ap.add_argument("--traj-dir", default=f"{ROOT}/runs/dedup_traj",
+                    help="holds one subdirectory per retrieval backend")
+    ap.add_argument("--corpus", default=f"{ROOT}/data/corpus.jsonl")
+    ap.add_argument("--out", default=f"{ROOT}/train_data/redesign",
+                    help="one training_data_<style>.jsonl is written per style")
+    ap.add_argument("--backends", nargs="+", default=COLLECTION_BACKENDS,
+                    help="subdirectories of --traj-dir, in the order v1 was built")
+    ap.add_argument("--styles", nargs="+", default=sorted(REDESIGN_INSTRUCTIONS,
+                                                          key=lambda v: int(v[1:])),
+                    help="query styles to render (default: all)")
+    ap.add_argument("--workers", type=int, default=4)
+    return ap.parse_args()
+
+
 def main():
+    global V1_PATH, TRAJ_BASE, CORPUS_PATH, OUT_DIR, SOURCES, VARIANTS
+    args = parse_args()
+    V1_PATH, TRAJ_BASE = args.v1, args.traj_dir
+    CORPUS_PATH, OUT_DIR = args.corpus, args.out
+    SOURCES, VARIANTS = args.backends, args.styles
+
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # index the v1 lines by content key
@@ -177,12 +204,12 @@ def main():
     global _CORPUS
     fork_ctx = multiprocessing.get_context("fork")
     for src in SOURCES:
-        trajs = load_all_trajectories(f"{TRAJ_BASE}/{src}_true")
+        trajs = load_all_trajectories(f"{TRAJ_BASE}/{src}")
         needed = collect_docids_from_trajectories(trajs)
         _CORPUS = load_corpus_jsonl(CORPUS_PATH, filter_docids=needed)
         print(f"[{src}] trajs={len(trajs)} corpus={len(_CORPUS)}", flush=True)
 
-        with fork_ctx.Pool(4, initializer=_init_worker) as pool:
+        with fork_ctx.Pool(args.workers, initializer=_init_worker) as pool:
             for out in pool.imap_unordered(replay_traj, trajs, chunksize=16):
                 for key, queries in out:
                     candidates += 1

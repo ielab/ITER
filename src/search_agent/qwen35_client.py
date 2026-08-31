@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from qwen35_utils.react_agent import MultiTurnReactAgent
-from webexplorer_utils.tool_search import SearchToolHandler, GetDocumentToolHandler
+from qwen35_utils.tool_search import SearchToolHandler, GetDocumentToolHandler
 from searcher import SearcherType
 import re
 
@@ -196,17 +196,8 @@ def process_tsv_dataset(tsv_path: str, searcher, llm_cfg: dict, args, output_dir
             query_style=args.query_style,
             dedup_search=args.dedup_search,
             dedup_pool_k=args.dedup_pool_k,
-            visited_penalty_gamma=args.visited_penalty_gamma,
-            visited_penalty_max_docs=args.visited_penalty_max_docs,
-            coverage_mmr_mode=args.coverage_mmr_mode,
-            coverage_mmr_lambda=args.coverage_mmr_lambda,
-            coverage_mmr_overfetch_k=args.coverage_mmr_overfetch_k,
-            label_feedback_mode=args.label_feedback,
         )
         get_document_handler = GetDocumentToolHandler(searcher=searcher)
-        if updater is not None:
-            updater.set_query_id(qid)
-            updater.attach(search_tool_handler)
         per_query_agent = MultiTurnReactAgent(
             llm=llm_cfg,
             function_list=["search", "get_document"],
@@ -231,20 +222,6 @@ def process_tsv_dataset(tsv_path: str, searcher, llm_cfg: dict, args, output_dir
             }
             persist_response(output_dir, qid, qtext, error_result, args)
 
-    updater = None
-    if getattr(args, "online_update", False):
-        if args.num_threads > 1:
-            args.num_threads = 1
-        from online_updater import OnlineUpdater
-        updater = OnlineUpdater(
-            searcher=searcher, gt_path=args.online_gt, replay_file=args.online_replay,
-            ckpt_dir=args.online_ckpt, lr=args.online_lr,
-            replay_ratio=args.online_replay_ratio, save_every=args.online_save_every,
-            opt_name=args.online_opt, lora_r=args.online_lora_r,
-            warmup_visits=args.online_warmup_visits, gate=args.online_gate,
-            merge=args.online_merge, certainty=args.online_certainty,
-            steps_per_visit=args.online_steps, interp=args.online_interp,
-        )
 
     if args.num_threads <= 1:
         with tqdm(remaining, desc="Queries", unit="query") as pbar:
@@ -274,40 +251,13 @@ def main():
 
     parser.add_argument("--snippet-max-tokens", type=int, default=512, help="Max tokens for search snippet truncation")
     parser.add_argument("--k", type=int, default=5, help="Number of search results to return")
-    parser.add_argument("--query-style", choices=["plain", "mem", "docs", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10"], default="plain",
+    parser.add_argument("--query-style", choices=["plain", "i1", "i2", "i3", "i4", "i5", "i6", "i7"], default="plain",
                         help="Retriever query form: plain sub-query; mem = [Q]+[Now]+[Memory]; docs = [Q]+[Now]+[Prev]")
     parser.add_argument("--dedup-search", action="store_true",
                         help="Cross-step dedup: drop docids already surfaced by earlier searches in this trajectory")
     parser.add_argument("--dedup-pool-k", type=int, default=100,
                         help="Over-fetch depth for --dedup-search before keeping top-k")
-    parser.add_argument("--visited-penalty-gamma", type=float, default=0.0,
-                        help="Subtract gamma times the mean embedding of visited documents from each FAISS query")
-    parser.add_argument("--visited-penalty-max-docs", type=int, default=32,
-                        help="Maximum number of most recent visited documents used by --visited-penalty-gamma")
-    parser.add_argument("--coverage-mmr-mode", default="off", choices=["off", "fixed"],
-                        help="Cross-step coverage-MMR rerank mode (default: off)")
-    parser.add_argument("--coverage-mmr-lambda", type=float, default=0.2,
-                        help="MMR diversity weight lambda (default: 0.2)")
-    parser.add_argument("--coverage-mmr-overfetch-k", type=int, default=100,
-                        help="Over-fetch depth before MMR re-rank (default: 100)")
     # --- per-question TTA (opt-in; mirrors tongyi_client) ---
-    parser.add_argument("--online-update", action="store_true")
-    parser.add_argument("--online-gt", type=str, default="")
-    parser.add_argument("--online-replay", type=str, default="")
-    parser.add_argument("--online-ckpt", type=str, default="")
-    parser.add_argument("--online-lr", type=float, default=1e-5)
-    parser.add_argument("--online-replay-ratio", type=float, default=1.0)
-    parser.add_argument("--online-save-every", type=int, default=5)
-    parser.add_argument("--online-opt", choices=["adamw", "sgd"], default="adamw")
-    parser.add_argument("--online-lora-r", type=int, default=0)
-    parser.add_argument("--online-warmup-visits", type=int, default=0)
-    parser.add_argument("--online-gate", type=int, default=0)
-    parser.add_argument("--online-merge", type=int, default=0)
-    parser.add_argument("--online-certainty", type=int, default=0)
-    parser.add_argument("--online-steps", type=int, default=1)
-    parser.add_argument("--online-interp", type=float, default=0.0)
-    parser.add_argument("--label-feedback", action="store_true",
-                        help="Online label feedback: rate results helpful/not_helpful -> PRF + MMR penalty")
 
     parser.add_argument(
         "--searcher-type",
@@ -364,12 +314,6 @@ def main():
         query_style=args.query_style,
         dedup_search=args.dedup_search,
         dedup_pool_k=args.dedup_pool_k,
-        visited_penalty_gamma=args.visited_penalty_gamma,
-        visited_penalty_max_docs=args.visited_penalty_max_docs,
-        coverage_mmr_mode=args.coverage_mmr_mode,
-        coverage_mmr_lambda=args.coverage_mmr_lambda,
-        coverage_mmr_overfetch_k=args.coverage_mmr_overfetch_k,
-        label_feedback_mode=args.label_feedback,
     )
     get_document_handler = GetDocumentToolHandler(searcher=searcher)
     agent = MultiTurnReactAgent(

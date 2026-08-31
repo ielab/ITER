@@ -14,7 +14,7 @@ from transformers import AutoTokenizer
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from prompts import format_query, STRONG_SYSTEM_PROMPT, DEDUP_NOTICE
 from searcher import SearcherType
-from memory_utils import build_memory_query, build_prevdoc_query, build_redesign_query
+from memory_utils import build_redesign_query
 
 # redesigned structured styles (docs/query_input_redesign.md); i0 == plain
 REDESIGN_STYLES = ("i1", "i2", "i3", "i4", "i5", "i6", "i7")
@@ -64,13 +64,13 @@ class SearchToolHandler:
         self.dedup_pool_k = dedup_pool_k
         self.searched_docids = []
 
-        # memory-conditioned query state (mirrors webexplorer_utils/tool_search.py)
+        # memory-conditioned query state (mirrors qwen35_utils/tool_search.py)
         self.query_style = query_style
         self.original_question = original_question
-        self.visited_reasonings = []     # v1 [Memory]: post-visit reasoning, oldest -> newest
-        self.query_groups = []           # v2 [Prev]: [{"query":.., "docs":[docid,..]}] per search
         # redesigned format: per-interaction visits with paired reasoning
         self.interactions = []           # [{"query":.., "visits":[[docid, reasoning], ...]}]
+        # i6/i7 pre-search reasoning: the reasoning items of the turn issuing this search
+        self.current_thinking = None
 
         self.tokenizer = None
         if (snippet_max_tokens and snippet_max_tokens > 0) or query_style != "plain":
@@ -128,12 +128,17 @@ class SearchToolHandler:
         else:
             raise ValueError(f"Unknown tool: {tool_name}")
 
+    def set_current_thinking(self, thinking: str):
+        """Store the reasoning of the turn issuing the current search (pre-search)."""
+        thinking = (thinking or "").strip()
+        self.current_thinking = thinking or None
+
     def add_visit_reasoning(self, reasoning: str):
-        """Append the agent's post-visit reasoning (v1 [Memory]). Called by the caller loop."""
+        """Attach the agent's post-visit reasoning to the document it just read."""
         reasoning = (reasoning or "").strip()
         if reasoning:
-            self.visited_reasonings.append(reasoning)
-            # redesigned format: pair with the newest visit that has none yet
+            # the reasoning arrives one turn after its visit -- pair it with the
+            # newest visit that does not have one yet
             for g in reversed(self.interactions):
                 if g["visits"]:
                     if not g["visits"][-1][1]:
@@ -141,14 +146,11 @@ class SearchToolHandler:
                     break
 
     def add_visited_docid(self, docid: str):
-        """Record a visited docid under the current sub-query group (v2 [Prev])."""
-        if self.query_groups:
-            self.query_groups[-1]["docs"].append(str(docid))
+        """Record a visited docid under the current sub-query group."""
         if self.interactions:
             self.interactions[-1]["visits"].append([str(docid), ""])
 
     def _start_query_group(self, query: str):
-        self.query_groups.append({"query": query, "docs": []})
         self.interactions.append({"query": query, "visits": []})
 
     def _build_styled_query(self, current_query: str) -> str:
@@ -159,15 +161,9 @@ class SearchToolHandler:
                      for g in self.interactions]
             return build_redesign_query(
                 self.query_style, self.original_question, current_query,
-                inter, self.tokenizer)
-        if self.query_style == "docs":
-            get_text = lambda d: (self.searcher.get_document(d) or {}).get("text")
-            return build_prevdoc_query(
-                self.original_question, current_query,
-                list(self.query_groups), get_text, self.tokenizer)
-        return build_memory_query(
-            self.original_question, current_query,
-            list(self.visited_reasonings), self.tokenizer)
+                inter, self.tokenizer,
+                pre_reasoning=self.current_thinking or "")
+        raise ValueError(f"unknown query style: {self.query_style}")
 
     def _extract_title(self, text: str) -> str:
         title = ""
@@ -182,9 +178,11 @@ class SearchToolHandler:
 
     def _search(self, query: str):
         hidden = []
-        retrieval_query = self._build_styled_query(query) if self.query_style != "plain" else query
         if self.query_style != "plain":
+            retrieval_query = self._build_styled_query(query)
             self._start_query_group(query)
+        else:
+            retrieval_query = query
 
         if self.dedup_search:
             pool = self.searcher.search(retrieval_query, max(self.k, self.dedup_pool_k))
@@ -336,6 +334,14 @@ def handle_conversation(args, searcher, query_text, qid=None):
 
         function_calls = [it for it in output_items if it.get("type") == "function_call"] if not force_text_only else []
 
+        # pre-search reasoning: the reasoning items of THIS turn are the thought that
+        # led to this turn's search call (the Responses-API counterpart of the ReAct
+        # clients' <think>). Must be set before the tool is executed.
+        if any((fc.get("name") or "").startswith("search") for fc in function_calls):
+            tool_handler.set_current_thinking("\n".join(
+                _reasoning_text(it) for it in output_items if it.get("type") == "reasoning"
+            ))
+
         if not function_calls:
             status = "completed"
             break
@@ -461,7 +467,7 @@ def main():
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--get-document", action="store_true")
     parser.add_argument("--strong", action="store_true", help="Use STRONG_SYSTEM_PROMPT")
-    parser.add_argument("--query-style", choices=["plain", "mem", "docs", "i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10"], default="plain")
+    parser.add_argument("--query-style", choices=["plain", "i1", "i2", "i3", "i4", "i5", "i6", "i7"], default="plain")
     parser.add_argument("--dedup-search", action="store_true")
     parser.add_argument("--dedup-pool-k", type=int, default=100)
 

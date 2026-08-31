@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Shared [Memory] construction for the diversity-aware retriever (v2).
+Query construction for ITER, shared by data extraction, training and inference.
 
 Both the data builder (src/data_builder.py) and the inference-time
 query builder (search_agent/.../tool_search.py) import this module so the
@@ -117,6 +117,10 @@ def build_memory_block(
     return " ; ".join(kept)
 
 
+# Not one of the paper's representations. It survives because data_builder.py
+# writes it as each training group's `query`, and rebuild_query_redesign.py uses
+# that string as the identity key when it matches replayed candidates back to
+# the groups. Changing it would invalidate any training file already built.
 def build_memory_query(
     question,
     current_query,
@@ -140,66 +144,7 @@ def build_memory_query(
 
 
 # -------------------------
-# v2 [Prev] block: prior sub-queries + the docs visited under each (title + snippet)
-# -------------------------
-def _extract_title(passage_text):
-    """First-line / front-matter title of a corpus passage (mirrors tool_search)."""
-    title = ""
-    if passage_text.startswith("---\ntitle:"):
-        parts = passage_text.split("\n")
-        if len(parts) > 1:
-            title = parts[1].replace("title:", "").strip().strip('"')
-    if not title:
-        first = passage_text.split("\n")[0].strip()
-        title = first[:50] + "..." if len(first) > 50 else first
-    return title
-
-
-def build_prevdoc_query(
-    question,
-    current_query,
-    prev_groups,
-    get_text,
-    tokenizer,
-    per_doc_tokens=48,
-    budget_tokens=256,
-):
-    """v2 retriever query: [Q] + [Now] + [Prev].
-
-    prev_groups: list of {"query": sub_query, "docs": [docid, ...]} for sub-queries
-    STRICTLY before the current one, oldest -> newest. Each entry pairs a prior
-    sub-query with the title+snippet of the docs visited under it. Groups with no
-    visited docs are skipped. Newest groups are kept first under the token budget.
-
-    get_text(docid) -> passage text or None. Lets the builder back this with a
-    corpus dict and inference back it with the live searcher (byte-identical form).
-    """
-    lines = [f"[Q] {question}", f"[Now] {current_query}"]
-    entries = []
-    used = 0
-    for g in reversed(prev_groups):
-        docs = [(d, get_text(d)) for d in g["docs"]]
-        docs = [(d, t) for d, t in docs if t]
-        if not docs:
-            continue
-        doc_strs = []
-        for d, text in docs:
-            title = _extract_title(text)
-            snip = _truncate_tokens(tokenizer, text, per_doc_tokens)
-            doc_strs.append(f"{title}: {snip}" if title else snip)
-        entry = f"{g['query']} -> " + " ; ".join(doc_strs)
-        elen = _token_len(tokenizer, entry)
-        if used + elen > budget_tokens:
-            break
-        entries.append(entry)
-        used += elen
-    if entries:
-        lines.append("[Prev] " + " | ".join(entries))
-    return "\n".join(lines)
-
-
-# -------------------------
-# Redesigned structured query (docs/query_input_redesign.md)
+# Redesigned structured query (docs/query_representations.md)
 # -------------------------
 # Constant template with <empty> placeholders; history grouped per interaction,
 # ALL interactions kept (no budget); doc/note items truncated per-item and
@@ -209,41 +154,33 @@ REDESIGN_INSTRUCTIONS = {
     "i0": "Given a web search query, retrieve relevant passages that answer the query",
     "i1": "Given the main question and the current sub-query, retrieve documents relevant to the current sub-query.",
     "i2": "Given the main question, the current sub-query, and the sub-queries already tried in previous interactions, retrieve documents relevant to the current sub-query that provide NEW information not yet found.",
+    # i3-i5 put the consumed evidence itself back into the query: the visited
+    # documents as the agent saw them (64-token snippets), the interpretations
+    # extracted from its post-visit reasoning, or both.
     "i3": "Given the main question, the current sub-query, and previous interactions with the documents already visited, retrieve documents relevant to the current sub-query that provide NEW information beyond the visited documents.",
-    "i4": "Given the main question, the current sub-query, and previous interactions with the documents already visited and notes taken on them, retrieve documents relevant to the current sub-query that provide NEW information beyond the visited documents.",
-    "i5": "Given the main question, the current sub-query, and previous interactions with notes taken on the documents already read, retrieve documents relevant to the current sub-query that provide NEW information beyond what the notes cover.",
-    # i6/i7 = i3/i4 with the agent-view document representation (64-token
-    # snippets, no [docs_id:x] tags) -- same fields, so same instructions
-    "i6": "Given the main question, the current sub-query, and previous interactions with the documents already visited, retrieve documents relevant to the current sub-query that provide NEW information beyond the visited documents.",
-    "i7": "Given the main question, the current sub-query, and previous interactions with the documents already visited and notes taken on them, retrieve documents relevant to the current sub-query that provide NEW information beyond the visited documents.",
-    # i8/i9/i10 borrow AgentIR's PRE-search reasoning (arXiv:2603.04384): the
+    "i4": "Given the main question, the current sub-query, and previous interactions with notes taken on the documents already read, retrieve documents relevant to the current sub-query that provide NEW information beyond what the notes cover.",
+    "i5": "Given the main question, the current sub-query, and previous interactions with the documents already visited and notes taken on them, retrieve documents relevant to the current sub-query that provide NEW information beyond the visited documents.",
+    # i6/i7 borrow AgentIR's PRE-search reasoning (arXiv:2603.04384): the
     # <think> of the turn issuing the search, uncleaned and untruncated.
-    # i8  = AgentIR's own input format (reasoning + sub-query, raw newlines);
-    # i9  = i2's structured format + a Current Reasoning field;
-    # i10 = i8's two fields in OUR template (Current Reasoning + Current
-    #       Subquery lines, one-lined, <empty>) -- i8 vs i10 isolates the
-    #       packaging, i10 vs i9 isolates main question + history.
-    # Instructions are OURS (family style: fields + target + NEW-information
-    # clause) -- our training data's positives are novelty-based, so the
-    # instruction states our objective, not AgentIR's "answer the query".
-    # AgentIR's own instruction is only used on the off-the-shelf AgentIR-4B
-    # line (query-style=reason, bash/job_agentir/).
-    "i8": "Given the agent's reasoning that led to the current sub-query, retrieve documents relevant to the current sub-query that provide NEW information beyond what the reasoning already covers.",
-    "i9": "Given the main question, the agent's reasoning and the current sub-query it led to, and the sub-queries already tried in previous interactions, retrieve documents relevant to the current sub-query that provide NEW information not yet found.",
-    "i10": "Given the agent's reasoning and the current sub-query it led to, retrieve documents relevant to the current sub-query that provide NEW information beyond what the reasoning already covers.",
+    # i6 = AgentIR's own input format (reasoning + sub-query, raw newlines);
+    # i7 = i2's structured format plus a Current Reasoning field.
+    # The instructions are OURS, in the family style (fields, target, and the
+    # NEW-information clause), because our positives are novelty-based. The
+    # off-the-shelf AgentIR-4B line is served with AgentIR's own instruction
+    # instead; see config.SETTINGS["agentir"].
+    "i6": "Given the agent's reasoning that led to the current sub-query, retrieve documents relevant to the current sub-query that provide NEW information beyond what the reasoning already covers.",
+    "i7": "Given the main question, the agent's reasoning and the current sub-query it led to, and the sub-queries already tried in previous interactions, retrieve documents relevant to the current sub-query that provide NEW information not yet found.",
 }
 
 # per-variant rendering: (with_docs, with_notes, docid_tags, per_doc_tokens)
-# i6/i7 mirror i3/i4 but drop the [docs_id:x] tags and cut documents to the
-# 64-token search-snippet length the agent saw; notes stay at 128.
+# i3/i5 show documents the way the agent saw them: the 64-token search snippet,
+# untagged. i4 carries notes only, tagged, at 128 tokens.
 _VARIANT_CFG = {
     "i2": (False, False, True, 128),
-    "i3": (True, False, True, 128),
-    "i4": (True, True, True, 128),
-    "i5": (False, True, True, 128),
-    "i6": (True, False, False, 64),
-    "i7": (True, True, False, 64),
-    "i9": (False, False, True, 128),  # i2 fields + Current Reasoning line
+    "i3": (True, False, False, 64),
+    "i4": (False, True, True, 128),
+    "i5": (True, True, False, 64),
+    "i7": (False, False, True, 128),   # i2 fields + a Current Reasoning line
 }
 
 
@@ -290,21 +227,16 @@ def build_redesign_query(
     interactions: [{"query": sub_query, "visits": [(docid, doc_text, raw_reasoning)]}]
         oldest -> newest, EXCLUDING the current search. doc_text = clean corpus
         text (no tool-output header); raw_reasoning may be "".
-    pre_reasoning (i8/i9/i10): the agent's <think> text of the turn issuing
-        this search, raw. Empty -> "Empty" in i8 (AgentIR's convention),
-        "<empty>" in i9/i10 (ours).
+    pre_reasoning (i6/i7): the agent's <think> text of the turn issuing this
+        search, raw. Empty renders as "Empty" in i6 (AgentIR's convention) and
+        "<empty>" in i7 (ours).
     """
     if variant == "i0":
         return current_subquery
-    if variant == "i8":
+    if variant == "i6":
         return f"Reasoning: {pre_reasoning or 'Empty'}\n\nQuery: {current_subquery}"
-    if variant == "i10":
-        # i8's two fields in our template: one-lined reasoning, <empty> rule
-        reason = _oneline(pre_reasoning)
-        return (f"Current Reasoning: {reason if reason else '<empty>'}\n"
-                f"Current Subquery: {current_subquery}")
     lines = [f"Main Question: {main_question}"]
-    if variant == "i9":
+    if variant == "i7":
         # AgentIR reasoning borrowed into the i2 structure: uncleaned and
         # untruncated, whitespace-collapsed to keep one-line-per-field.
         # Reasoning BEFORE the subquery -- the thought leads to the search.

@@ -47,6 +47,9 @@ def parse_args():
     ap.add_argument("--ef-search", type=int, default=256,
                     help="HNSW query-time depth, baked into the index (higher = better recall)")
     ap.add_argument("--threads", type=int, default=0, help="faiss OMP threads (0 = all)")
+    ap.add_argument("--retriever", default="",
+                    help="the encoder that produced the shards; recorded in encoder.json "
+                         "so run_eval.py can refuse a mismatched index")
     return ap.parse_args()
 
 
@@ -98,6 +101,11 @@ def main():
     with open(lookup_path, "wb") as f:
         pickle.dump(lookup, f)
     logger.info("done: %d vectors -> %s (+ %s)", total, index_path, lookup_path)
+
+    # record the encoder, so evaluation can refuse an index built by another one
+    if args.retriever:
+        from index_meta import write_meta
+        logger.info("wrote %s", write_meta(args.out_dir, args.retriever))
 
 
 if __name__ == "__main__":

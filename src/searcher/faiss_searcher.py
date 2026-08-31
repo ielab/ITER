@@ -98,7 +98,6 @@ class FaissSearcher(BaseSearcher):
         self.tokenizer = None
         self.lookup = None
         self.docid_to_text = None
-        self.docid_to_vector = None
 
         logger.info("Initializing FAISS searcher...")
 
@@ -163,11 +162,8 @@ class FaissSearcher(BaseSearcher):
             )
 
         self.lookup = []
-        self.docid_to_vector = {}
         for p_reps, p_lookup in shards:
             self.retriever.add(p_reps)
-            for passage_id, vector in zip(p_lookup, p_reps):
-                self.docid_to_vector[str(passage_id)] = np.asarray(vector, dtype=np.float32)
             self.lookup += p_lookup
 
         self._setup_gpu()
@@ -321,10 +317,6 @@ class FaissSearcher(BaseSearcher):
                 f"Failed to load dataset '{self.args.dataset_name}': {e}"
             )
 
-    @property
-    def supports_visited_penalty(self) -> bool:
-        return True
-
     def _encode_query(self, query: str) -> np.ndarray:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         if not all([self.retriever, self.model, self.tokenizer, self.lookup]):
@@ -346,130 +338,12 @@ class FaissSearcher(BaseSearcher):
                 q_reps = self.model.encode_query(batch_dict)
                 return q_reps.cpu().detach().numpy().astype(np.float32)
 
-    def _apply_visited_penalty(
-        self,
-        q_reps: np.ndarray,
-        history_docids: Optional[List[str]],
-        gamma: float,
-        max_docs: Optional[int],
-    ) -> np.ndarray:
-        if gamma <= 0 or not history_docids:
-            return q_reps
-
-        vectors = []
-        for docid in history_docids[-max_docs:] if max_docs else history_docids:
-            vector = self.docid_to_vector.get(str(docid)) if self.docid_to_vector else None
-            if vector is not None:
-                vectors.append(vector)
-
-        if not vectors:
-            return q_reps
-
-        history_center = np.mean(np.stack(vectors, axis=0), axis=0, keepdims=True)
-        adjusted = q_reps - gamma * history_center
-        if self.args.normalize:
-            norm = np.linalg.norm(adjusted, axis=1, keepdims=True)
-            adjusted = adjusted / np.maximum(norm, 1e-12)
-        return adjusted.astype(np.float32)
-
-    # ---- LRAT coverage-MMR + label-PRF (synced from LRAT) ----
-    def supports_coverage_mmr(self) -> bool:
-        return True
-
-    def _get_doc_vector(self, docid: str) -> Optional[np.ndarray]:
-        return self.docid_to_vector.get(str(docid)) if self.docid_to_vector else None
-
-    def _coverage_mmr_rerank(
-        self,
-        results: List[Dict[str, Any]],
-        history_docids: List[str],
-        lamb: float,
-        k: int,
-        max_history: int,
-    ) -> List[Dict[str, Any]]:
-        if lamb <= 0 or not history_docids:
-            return results[:k]
-        history = history_docids[-max_history:] if max_history > 0 else history_docids
-        history_vecs = [self._get_doc_vector(d) for d in history]
-        history_vecs = [v for v in history_vecs if v is not None]
-        if not history_vecs:
-            return results[:k]
-        h = np.stack(history_vecs, axis=0)
-        reranked = []
-        for result in results:
-            vec = self._get_doc_vector(str(result.get("docid")))
-            redundancy = float(np.max(h @ vec)) if vec is not None else 0.0
-            item = dict(result)
-            item["mmr_score"] = float(result["score"]) - lamb * redundancy
-            reranked.append(item)
-        reranked.sort(key=lambda x: x["mmr_score"], reverse=True)
-        return reranked[:k]
-
-    def _apply_label_prf(
-        self,
-        q_reps: np.ndarray,
-        positive_docids: Optional[List[str]],
-        gamma: float,
-    ) -> np.ndarray:
-        if gamma <= 0 or not positive_docids:
-            return q_reps
-        vecs = [self._get_doc_vector(d) for d in positive_docids]
-        vecs = [v for v in vecs if v is not None]
-        if not vecs:
-            return q_reps
-        center = np.mean(np.stack(vecs, axis=0), axis=0, keepdims=True)
-        adjusted = q_reps + gamma * center
-        norm = np.linalg.norm(adjusted, axis=1, keepdims=True)
-        return (adjusted / np.maximum(norm, 1e-12)).astype(np.float32)
-
-    def _apply_two_stage_prf(
-        self,
-        q_reps: np.ndarray,
-        visited_docids: Optional[List[str]],
-        rated_docids: Optional[List[str]],
-        visited_gamma: float,
-        rated_gamma: float,
-    ) -> np.ndarray:
-        # visited (stronger signal) applied first, then rated helpful (weaker)
-        q_reps = self._apply_label_prf(q_reps, visited_docids, visited_gamma)
-        q_reps = self._apply_label_prf(q_reps, rated_docids, rated_gamma)
-        return q_reps
-
-    def search(
-        self,
-        query: str,
-        k: int = 10,
-        history_docids: Optional[List[str]] = None,
-        visited_penalty_gamma: float = 0.0,
-        visited_penalty_max_docs: Optional[int] = None,
-        coverage_mmr_mode: str = "off",
-        coverage_mmr_history_docids: Optional[List[str]] = None,
-        coverage_mmr_lambda: float = 0.2,
-        coverage_mmr_overfetch_k: int = 100,
-        coverage_mmr_max_history_docs: int = 200,
-        visited_prf_docids: Optional[List[str]] = None,
-        rated_prf_docids: Optional[List[str]] = None,
-        visited_prf_gamma: float = 0.5,
-        rated_prf_gamma: float = 0.3,
-    ) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         if not all([self.retriever, self.model, self.tokenizer, self.lookup]):
             raise RuntimeError("Searcher not properly initialized")
 
         q_reps = self._encode_query(query)
-        # ITER visited-penalty: push query away from visited docs
-        q_reps = self._apply_visited_penalty(
-            q_reps,
-            history_docids=history_docids,
-            gamma=visited_penalty_gamma,
-            max_docs=visited_penalty_max_docs,
-        )
-        # LRAT label-PRF: pull query toward visited (strong) + rated-helpful (weak)
-        q_reps = self._apply_two_stage_prf(
-            q_reps, visited_prf_docids, rated_prf_docids, visited_prf_gamma, rated_prf_gamma
-        )
-
-        search_k = max(k, coverage_mmr_overfetch_k) if coverage_mmr_mode != "off" else k
-        all_scores, psg_indices = self.retriever.search(q_reps, search_k)
+        all_scores, psg_indices = self.retriever.search(q_reps, k)
 
         results = []
         for score, index in zip(all_scores[0], psg_indices[0]):
@@ -480,19 +354,7 @@ class FaissSearcher(BaseSearcher):
                 {"docid": passage_id, "score": float(score), "text": passage_text}
             )
 
-        if coverage_mmr_mode == "off":
-            return results[:k]
-
-        history = [str(d) for d in (coverage_mmr_history_docids or [])]
-        self.last_coverage_mmr_trace = {
-            "mode": coverage_mmr_mode,
-            "lambda": coverage_mmr_lambda,
-            "history_size": len(history),
-            "overfetch_k": coverage_mmr_overfetch_k,
-        }
-        return self._coverage_mmr_rerank(
-            results, history, coverage_mmr_lambda, k, coverage_mmr_max_history_docs
-        )
+        return results
 
     def get_document(self, docid: str) -> Optional[Dict[str, Any]]:
         if not self.docid_to_text:
@@ -547,14 +409,7 @@ class ReasonIrSearcher(FaissSearcher):
 
         logger.info("Model loaded successfully")
 
-    def search(
-        self,
-        query: str,
-        k: int = 10,
-        history_docids: Optional[List[str]] = None,
-        visited_penalty_gamma: float = 0.0,
-        visited_penalty_max_docs: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+    def search(self, query: str, k: int = 10) -> List[Dict[str, Any]]:
         if not all([self.retriever, self.model, self.lookup]):
             raise RuntimeError("Searcher not properly initialized")
 
@@ -567,15 +422,9 @@ class ReasonIrSearcher(FaissSearcher):
                     instruction="<|user|>\nGiven a question, retrieve relevant passages that help answer the question\n<|embed|>\n",
                 )
         q_reps = np.asarray(q_reps, dtype=np.float32)
-        q_reps = self._apply_visited_penalty(
-            q_reps,
-            history_docids=history_docids,
-            gamma=visited_penalty_gamma,
-            max_docs=visited_penalty_max_docs,
-        )
 
         all_scores, psg_indices = self.retriever.search(q_reps, k)
-        
+
         results = []
         for score, index in zip(all_scores[0], psg_indices[0]):
             passage_id = self.lookup[index]

@@ -1,5 +1,5 @@
 # Raw-text ReAct client for the Qwen3.5/3.6 family (qwen3_5 / qwen3_5_moe
-# architectures). Mirrors webexplorer_utils/react_agent.py verbatim in structure:
+# architectures). Mirrors tongyi_utils/react_agent.py in structure:
 # tool definitions + <tool_call>{"name":..,"arguments":..}</tool_call> convention
 # are hand-written into the system prompt, and the model's raw text output is
 # parsed client-side -- vLLM is launched WITHOUT --enable-auto-tool-choice /
@@ -32,10 +32,8 @@ import time
 import random
 import datetime
 
-from webexplorer_utils.tool_search import SearchToolHandler
+from qwen35_utils.tool_search import SearchToolHandler
 
-# label-feedback: parse "DocID:<id> -> helpful|not_helpful" rating lines
-_LABEL_RE = re.compile(r'DocID[:\s]+(\d+)[^a-z\n]{0,30}(not[_\s]helpful|helpful)', re.IGNORECASE)
 
 SYSTEM_PROMPT_SEARCH_ONLY = """You are a helpful assistant.
 
@@ -193,38 +191,6 @@ class MultiTurnReactAgent(FnCallAgent):
         )
         return len(input_ids)
 
-    def _rate_search_results(self, search_result_text: str, original_question: str,
-                              docids: list, planning_port: int, messages: list):
-        docid_lines = "\n".join(f"DocID:{d} ->" for d in docids)
-        rating_user_msg = {
-            "role": "user",
-            "content": (
-                f"The above search just returned the following results. "
-                f"Please evaluate each one for its potential to help answer the research question. "
-                f"Your feedback will be used to improve the future retriever behaviour.\n\n"
-                f"{search_result_text}\n\n"
-                f"For each DocID, complete the label — helpful or not_helpful:\n"
-                f"  helpful     — contains any useful information or clues, even partial\n"
-                f"  not_helpful — clearly off-topic or does not contribute at all\n\n"
-                f"Output only the completed label lines, no explanation:\n{docid_lines}"
-            ),
-        }
-        msgs = messages + [rating_user_msg]
-        old_thinking = self.enable_thinking
-        old_max_gen = self.max_generation
-        self.enable_thinking = False
-        self.max_generation = 256
-        content, _ = self.call_server(msgs, planning_port)
-        self.enable_thinking = old_thinking
-        self.max_generation = old_max_gen
-        positive, negative = [], []
-        for m in _LABEL_RE.finditer(content):
-            docid, label = m.group(1), m.group(2).lower()
-            if 'not' in label:
-                negative.append(docid)
-            else:
-                positive.append(docid)
-        return positive, negative
 
     def _run(self, data: str, model: str, **kwargs) -> List[List[Message]]:
         self.model = model
@@ -299,18 +265,16 @@ class MultiTurnReactAgent(FnCallAgent):
 
                     tool_call_counts_all[tool_name] = tool_call_counts_all.get(tool_name, 0) + 1
 
+                    # i6/i7: hand the current turn's <think> to the search tool
+                    # BEFORE the search is issued
+                    if tool_name == 'search' and self.search_tool:
+                        thinks = re.findall(r'<think>(.*?)</think>', content, re.DOTALL)
+                        self.search_tool.set_current_thinking(" ".join(t.strip() for t in thinks))
+
                     result, docids = self.custom_call_tool(tool_name, tool_args)
                     if tool_name in ("get_document", "visit"):
                         pending_visit = True
 
-                    if (tool_name == 'search' and docids
-                            and getattr(self.search_tool, 'label_feedback_mode', False)
-                            and num_llm_calls_available > 0):
-                        num_llm_calls_available -= 1
-                        pos, neg = self._rate_search_results(
-                            result, self.search_tool.original_question, docids, planning_port, messages)
-                        if (pos or neg) and self.search_tool:
-                            self.search_tool.update_doc_labels(pos, neg)
 
                     if docids is not None:
                         tool_call_counts[tool_name] = tool_call_counts.get(tool_name, 0) + 1

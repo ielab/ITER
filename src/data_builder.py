@@ -29,10 +29,10 @@ returned docs into the `Already-seen` hint and the hint is meant to resurface
 returned-but-unread gold, so penalising returned docs would train the retriever
 to bury that hint-gold. Historical search-not-visit left unread is in NO tier.
 
-Two query forms are produced in one pass (shared pos/neg, query string differs):
-  v1: [Q] + [Now] + [Memory]   ([Memory] = cleaned post-visit reasoning list)
-  v2: [Q] + [Now] + [Prev]     ([Prev]   = prior sub-queries + their visited docs'
-                                            title+snippet)
+The `query` field this writes is not one of the paper's representations: it is
+the legacy [Q] + [Now] + [Memory] form, kept because it doubles as the identity
+key that src/rebuild_query_redesign.py matches replayed candidates against.
+That script rewrites `query` into each of i0-i7.
 
 Relevance is decided by a live LLM judge over the agent's post-visit reasoning
 (same as the original LRAT builder); requires --judge-api-url.
@@ -45,8 +45,7 @@ Example:
 python src/data_builder.py \
   --corpus-path data/corpus.jsonl \
   --traj-dir runs/dedup_traj/bm25 \
-  --output-v1 training_data/bm25.v1.jsonl \
-  --output-v2 training_data/bm25.v2.jsonl \
+  --output training_data/bm25.jsonl \
   --tokenizer-path Qwen/Qwen3-Embedding-0.6B \
   --judge-api-url http://127.0.0.1:6009/v1/chat/completions \
   --judge-model auto --max-workers 32 --future-timeout 30
@@ -70,7 +69,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 
-from memory_utils import build_memory_query, build_prevdoc_query
+from memory_utils import build_memory_query
 
 
 logging.basicConfig(
@@ -307,7 +306,6 @@ def extract_pairs(traj: Dict[str, Any], tokenizer, corpus: Dict[str, str], judge
 
     # live state, updated as visits happen (feeds FUTURE search snapshots)
     v1_reasonings: List[str] = []        # raw post-visit reasoning of all visits so far
-    v2_groups: List[Dict[str, Any]] = [] # [{"query":.., "docs":[docid,..]}] per search
     visited_seen: List[str] = []         # ordered unique: all docs visited so far
     visited_set = set()
     visited_sat: Dict[str, bool] = {}    # docid -> relevance at first visit (tier split)
@@ -327,11 +325,9 @@ def extract_pairs(traj: Dict[str, Any], tokenizer, corpus: Dict[str, str], judge
             sub_query = _search_query(step)
             snap = {
                 "q_v1": build_memory_query(question, sub_query, v1_reasonings, tokenizer),
-                "q_v2": build_prevdoc_query(question, sub_query, list(v2_groups), corpus.get, tokenizer),
                 "visited_seen": list(visited_seen),      # frozen: pre-search visits
                 "returned": _search_returned_docids(step),
             }
-            v2_groups.append({"query": sub_query, "docs": []})
             i += 1
             continue
 
@@ -356,7 +352,6 @@ def extract_pairs(traj: Dict[str, Any], tokenizer, corpus: Dict[str, str], judge
                     if neg_div_ids or neg_hard_ids or neg_weak_ids:
                         samples.append({
                             "query_v1": snap["q_v1"],
-                            "query_v2": snap["q_v2"],
                             "pos": [corpus[docid]],
                             "pos_id": [docid],
                             "neg_diversity": [corpus[d] for d in neg_div_ids],
@@ -371,8 +366,6 @@ def extract_pairs(traj: Dict[str, Any], tokenizer, corpus: Dict[str, str], judge
                 # update live state for future snapshots (snapshot above stays frozen)
                 if reasoning:
                     v1_reasonings.append(reasoning)
-                if v2_groups:
-                    v2_groups[-1]["docs"].append(docid)
                 if first_time:
                     visited_set.add(docid)
                     visited_seen.append(docid)
@@ -463,8 +456,8 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--corpus-path",    required=True)
     ap.add_argument("--traj-dir",       required=True)
-    ap.add_argument("--output-v1",      required=True, help="v1 ([Memory]) training JSONL")
-    ap.add_argument("--output-v2",      required=True, help="v2 ([Prev]) training JSONL")
+    ap.add_argument("--output",         required=True,
+                    help="training groups; rendered into query styles by rebuild_query_redesign.py")
     ap.add_argument("--tokenizer-path", required=True)
     ap.add_argument("--judge-api-url",  required=True)
     ap.add_argument("--judge-model",    default="auto")
@@ -526,8 +519,7 @@ def main():
         n, half_life, mean_w, avg_div, avg_hard, avg_weak,
     )
 
-    _write(args.output_v1, all_samples, "query_v1")
-    _write(args.output_v2, all_samples, "query_v2")
+    _write(args.output, all_samples, "query_v1")
 
 
 if __name__ == "__main__":

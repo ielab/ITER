@@ -2,11 +2,10 @@ from typing import Union, List
 from qwen_agent.tools.base import BaseTool, register_tool
 from transformers import AutoTokenizer
 
-from memory_utils import build_memory_query, build_prevdoc_query, build_redesign_query
+from memory_utils import build_redesign_query
 
 # redesigned structured styles (docs/query_input_redesign.md); i0 == plain
-# i8/i9 = AgentIR-style, built from the current turn's <think> (set_current_thinking)
-REDESIGN_STYLES = ("i1", "i2", "i3", "i4", "i5", "i6", "i7", "i8", "i9", "i10")
+REDESIGN_STYLES = ("i1", "i2", "i3", "i4", "i5", "i6", "i7")
 
 
 @register_tool("search", allow_overwrite=True)
@@ -18,18 +17,11 @@ class SearchToolHandler(BaseTool):
         searcher,
         snippet_max_tokens: int = 512,
         k: int = 5,
-        query_style: str = "plain",  # plain | mem | docs | reason (AgentIR) | i1..i7 (redesigned; i0 == plain)
+        query_style: str = "plain",  # plain (== i0) | i1..i7, see docs/query_representations.md
         found_budget: int = 256,
         found_per_doc: int = 32,
         dedup_search: bool = False,
         dedup_pool_k: int = 100,
-        visited_penalty_gamma: float = 0.0,
-        visited_penalty_max_docs: int = 32,
-        coverage_mmr_mode: str = "off",
-        coverage_mmr_lambda: float = 0.2,
-        coverage_mmr_overfetch_k: int = 100,
-        coverage_mmr_max_history_docs: int = 200,
-        label_feedback_mode: bool = False,
     ):
         super().__init__()
 
@@ -43,42 +35,23 @@ class SearchToolHandler(BaseTool):
         # search in this trajectory (the agent can revisit it from history).
         self.dedup_search = dedup_search
         self.dedup_pool_k = dedup_pool_k
-        self.visited_penalty_gamma = visited_penalty_gamma
-        self.visited_penalty_max_docs = visited_penalty_max_docs
-        if self.visited_penalty_gamma > 0 and not getattr(self.searcher, "supports_visited_penalty", False):
-            raise ValueError("--visited-penalty-gamma requires a FAISS-compatible searcher")
-        # LRAT coverage-MMR (post-retrieval rerank) + online label feedback
-        self.coverage_mmr_mode = coverage_mmr_mode
-        self.coverage_mmr_lambda = coverage_mmr_lambda
-        self.coverage_mmr_overfetch_k = coverage_mmr_overfetch_k
-        self.coverage_mmr_max_history_docs = coverage_mmr_max_history_docs
-        if self.coverage_mmr_mode not in ("off", "fixed"):
-            raise ValueError("--coverage-mmr-mode must be off or fixed")
-        if self.coverage_mmr_mode != "off" and not getattr(self.searcher, "supports_coverage_mmr", False):
-            raise ValueError("--coverage-mmr-mode requires a FAISS searcher")
-        self.label_feedback_mode = label_feedback_mode
         self.original_question = ""
         self.found_docids = []
         self.searched_docids = []
         self.visited_docids = []
         self.previous_queries = []
         self.search_traces = []
-        # online label feedback: helpful -> PRF pull, not_helpful -> MMR penalty pool
-        self.positive_labeled_docids = []
-        self.negative_labeled_docids = []
         # memory-conditioned query state (mirrors src/data_builder.py)
-        self.visited_reasonings = []     # v1 [Memory]: post-visit reasoning, oldest -> newest
-        self.query_groups = []           # v2 [Prev]: [{"query":.., "docs":[docid,..]}] per search
         # redesigned format: per-interaction visits with paired reasoning
         self.interactions = []           # [{"query":.., "visits":[[docid, reasoning], ...]}]
-        # AgentIR "reason" style: the agent's current-turn <think> text, set by the
+        # i6/i7 pre-search reasoning: the agent's current-turn <think>, set by the
         # agent right before each search call (frozen at search-issue time).
         self.current_thinking = None
 
         self.description = f"Performs a search on a knowledge source: supply a single 'query' string; the tool retrieves the top {self.k} most relevant results."
 
         self.tokenizer = None
-        if (snippet_max_tokens and snippet_max_tokens > 0) or query_style not in ("plain", "reason"):
+        if (snippet_max_tokens and snippet_max_tokens > 0) or query_style != "plain":
             self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-Embedding-0.6B")
 
     def _truncate(self, text: str, max_tokens: int) -> str:
@@ -98,20 +71,8 @@ class SearchToolHandler(BaseTool):
         self.visited_docids = []
         self.previous_queries = []
         self.search_traces = []
-        self.positive_labeled_docids = []
-        self.negative_labeled_docids = []
-        self.visited_reasonings = []
-        self.query_groups = []
         self.interactions = []
         self.current_thinking = None
-
-    def update_doc_labels(self, positive_docids: List[str], negative_docids: List[str]):
-        for d in positive_docids:
-            if d not in self.positive_labeled_docids:
-                self.positive_labeled_docids.append(d)
-        for d in negative_docids:
-            if d not in self.negative_labeled_docids:
-                self.negative_labeled_docids.append(d)
 
     def get_search_traces(self):
         return list(self.search_traces)
@@ -123,17 +84,16 @@ class SearchToolHandler(BaseTool):
                 self.found_docids.append(docid)
 
     def set_current_thinking(self, thinking: str):
-        """Store the agent's current-turn reasoning (AgentIR 'reason' style). Called by the agent before each search."""
+        """Store the agent's current-turn reasoning (i6/i7). Called before each search."""
         thinking = (thinking or "").strip()
         self.current_thinking = thinking or None
 
     def add_visit_reasoning(self, reasoning: str):
-        """Append the agent's post-visit reasoning (v1 [Memory]). Called by the agent."""
+        """Attach the agent's post-visit reasoning to the document it just read."""
         reasoning = (reasoning or "").strip()
         if reasoning:
-            self.visited_reasonings.append(reasoning)
-            # redesigned format: the reasoning arrives one turn after its visit --
-            # pair it with the newest visit that has none yet
+            # the reasoning arrives one turn after its visit -- pair it with the
+            # newest visit that does not have one yet
             for g in reversed(self.interactions):
                 if g["visits"]:
                     if not g["visits"][-1][1]:
@@ -141,12 +101,10 @@ class SearchToolHandler(BaseTool):
                     break
 
     def add_visited_docid(self, docid: str):
-        """Record a visited docid under the current sub-query group (v2 [Prev])."""
+        """Record a visited docid under the current sub-query group."""
         docid = str(docid)
         if docid not in self.visited_docids:
             self.visited_docids.append(docid)
-        if self.query_groups:
-            self.query_groups[-1]["docs"].append(docid)
         if self.interactions:
             self.interactions[-1]["visits"].append([docid, ""])
 
@@ -156,12 +114,10 @@ class SearchToolHandler(BaseTool):
             self.previous_queries.append(query)
 
     def _build_styled_query(self, current_query: str) -> str:
-        """Memory-conditioned retriever query (shared with src/data_builder.py).
+        """The history-conditioned query (docs/query_representations.md).
 
-        mem  (query_style="mem"):  [Q] + [Now] + [Memory] (visited reasonings)
-        docs (query_style="docs"): [Q] + [Now] + [Prev]   (prior sub-queries +
-                                          their visited docs' title+snippet)
-        i1..i5: redesigned structured format (docs/query_input_redesign.md)
+        Shared with src/data_builder.py, so the training and serving inputs are
+        byte-identical.
         """
         if self.query_style in REDESIGN_STYLES:
             get_text = lambda d: (self.searcher.get_document(d) or {}).get("text") or ""
@@ -172,17 +128,9 @@ class SearchToolHandler(BaseTool):
                 self.query_style, self.original_question, current_query,
                 inter, self.tokenizer,
                 pre_reasoning=self.current_thinking or "")
-        if self.query_style == "docs":
-            get_text = lambda d: (self.searcher.get_document(d) or {}).get("text")
-            return build_prevdoc_query(
-                self.original_question, current_query,
-                list(self.query_groups), get_text, self.tokenizer)
-        return build_memory_query(
-            self.original_question, current_query,
-            list(self.visited_reasonings), self.tokenizer)
+        raise ValueError(f"unknown query style: {self.query_style}")
 
     def _start_query_group(self, query: str):
-        self.query_groups.append({"query": query, "docs": []})
         self.interactions.append({"query": query, "visits": []})
 
     def _extract_title(self, passage_text: str) -> str:
@@ -211,7 +159,6 @@ class SearchToolHandler(BaseTool):
         """Structured per-doc record for the trace: docid + retrieval score."""
         return {"docid": str(r.get("docid")), "score": r.get("score")}
 
-
     def search_with_searcher(self, query: str, k: int = None):
         try:
             if k is None:
@@ -219,45 +166,14 @@ class SearchToolHandler(BaseTool):
 
             found_docids_before_search = list(self.found_docids)
             previous_queries_before_search = list(self.previous_queries)
-            if self.query_style == "reason":
-                # AgentIR format: current-turn reasoning + query (searcher/prompts.py of AgentIR)
-                retrieval_query = f"Reasoning: {self.current_thinking or 'Empty'}\n\nQuery: {query}"
-            elif self.query_style != "plain":
+            if self.query_style != "plain":
                 retrieval_query = self._build_styled_query(query)
                 # start this search's group AFTER building the query (which used prior groups)
                 self._start_query_group(query)
             else:
                 retrieval_query = query
             hidden = []
-            visited_penalty_docids = list(self.visited_docids) if self.visited_penalty_gamma > 0 else []
             search_kwargs = {}
-            if self.visited_penalty_gamma > 0:
-                search_kwargs = {
-                    "history_docids": visited_penalty_docids,
-                    "visited_penalty_gamma": self.visited_penalty_gamma,
-                    "visited_penalty_max_docs": self.visited_penalty_max_docs,
-                }
-            # LRAT coverage-MMR: penalty pool = confirmed not_helpful if available, else all searched
-            if self.coverage_mmr_mode != "off":
-                mmr_history = (
-                    list(self.negative_labeled_docids)
-                    if self.label_feedback_mode and self.negative_labeled_docids
-                    else list(self.searched_docids)
-                )
-                search_kwargs.update({
-                    "coverage_mmr_mode": self.coverage_mmr_mode,
-                    "coverage_mmr_history_docids": mmr_history,
-                    "coverage_mmr_lambda": self.coverage_mmr_lambda,
-                    "coverage_mmr_overfetch_k": self.coverage_mmr_overfetch_k,
-                    "coverage_mmr_max_history_docs": self.coverage_mmr_max_history_docs,
-                })
-            # LRAT label-PRF: visited docs (strong) + rated-helpful docs (weak) pull the query
-            if self.label_feedback_mode:
-                if self.found_docids:
-                    search_kwargs["visited_prf_docids"] = list(self.found_docids)
-                rated_only = [d for d in self.positive_labeled_docids if d not in self.found_docids]
-                if rated_only:
-                    search_kwargs["rated_prf_docids"] = rated_only
             if self.dedup_search:
                 # over-fetch, drop docids already surfaced in this trajectory, keep top-k
                 pool = self.searcher.search(retrieval_query, max(k, self.dedup_pool_k), **search_kwargs)
@@ -278,9 +194,7 @@ class SearchToolHandler(BaseTool):
                     "hidden": [self._record(r) for r in hidden],
                     "found_docids_before_search": found_docids_before_search,
                     "previous_queries_before_search": previous_queries_before_search,
-                    "visited_docids_before_search": visited_penalty_docids,
-                    "visited_penalty_gamma": self.visited_penalty_gamma,
-                    "visited_penalty_max_docs": self.visited_penalty_max_docs,
+                    "visited_docids_before_search": list(self.visited_docids),
                     "k": k,
                     "query_style": self.query_style,
                 })
@@ -306,9 +220,7 @@ class SearchToolHandler(BaseTool):
                 "hidden": [self._record(r) for r in hidden],     # dedup-suppressed: docid + score
                 "found_docids_before_search": found_docids_before_search,
                 "previous_queries_before_search": previous_queries_before_search,
-                "visited_docids_before_search": visited_penalty_docids,
-                "visited_penalty_gamma": self.visited_penalty_gamma,
-                "visited_penalty_max_docs": self.visited_penalty_max_docs,
+                "visited_docids_before_search": list(self.visited_docids),
                 "k": k,
                 "query_style": self.query_style,
             })
@@ -334,8 +246,6 @@ class SearchToolHandler(BaseTool):
                 "found_docids_before_search": list(self.found_docids),
                 "previous_queries_before_search": list(self.previous_queries),
                 "visited_docids_before_search": list(self.visited_docids),
-                "visited_penalty_gamma": self.visited_penalty_gamma,
-                "visited_penalty_max_docs": self.visited_penalty_max_docs,
                 "k": k if k is not None else self.k,
                 "query_style": self.query_style,
                 "error": str(e),

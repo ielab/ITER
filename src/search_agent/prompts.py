@@ -134,7 +134,7 @@ def format_query(query: str, query_template: str | None = None) -> str:
 
 # --- General-model agent prompts (native function-calling clients) ---
 # Strong behavioral spec (no <tool_call> format block: tools are defined via the
-# native `tools=[]` schema). Mirrors webexplorer_utils STRONG_SYSTEM_PROMPT.
+# native `tools=[]` schema). Mirrors the qwen35_utils STRONG_SYSTEM_PROMPT.
 STRONG_SYSTEM_PROMPT = """You are a meticulous research agent answering a hard, multi-constraint question. The answer is NOT in your memory; you must find it through search.
 
 # How you must work
@@ -144,7 +144,7 @@ STRONG_SYSTEM_PROMPT = """You are a meticulous research agent answering a hard, 
 - A search result only shows a short snippet. Before you rely on a document, call get_document to read its full text and check the details.
 - Only produce the final answer once every criterion is supported by evidence you actually retrieved. If anything is unverified, keep searching."""
 
-# Appended to the system prompt only in dedup mode. Mirrors webexplorer_utils DEDUP_NOTICE.
+# Appended to the system prompt only in dedup mode. Mirrors the qwen35_utils DEDUP_NOTICE.
 DEDUP_NOTICE = """
 
 # Retriever behavior
