@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Our SLURM job scripts. They encode UQ-specific scheduling (partitions, GPU
+# memory fractions, shard counts, port ranges, vLLM lifecycle) and nothing a
+# reader needs: every experimental parameter they used now lives in
+# src/config.py and the run_*.py entry points. Kept locally, not published.
+scripts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+envs/
+
+# Data and artefacts produced by the pipeline (see README §4-§7)
+data/
+datasets/
+models/
+runs/
+experiments/
+train_data/
+logs/
+
+# Model cards staged for Hugging Face, not part of the code release
+.hf-cards/
