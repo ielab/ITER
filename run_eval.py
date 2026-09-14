@@ -97,7 +97,7 @@ def main():
     if args.searcher != "bm25":
         cmd += ["--model-name", retriever,
                 "--dataset-name", bench.corpus,
-                "--pooling", "eos", "--normalize", "--torch-dtype", "float16",
+                "--pooling", "eos", "--normalize", "--torch-dtype", "bfloat16",
                 "--task-prefix", setting.prefix,
                 "--max-length", str(setting.max_length)]
 
