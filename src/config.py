@@ -84,7 +84,7 @@ class Backbone:
     """A deep-research agent: which model to serve and which client drives it."""
     model: str
     client: str                             # tongyi | qwen35 | gptoss
-    max_model_len: int = 131072
+    max_model_len: int = 262144
     vllm_flags: list = field(default_factory=list)
 
 
