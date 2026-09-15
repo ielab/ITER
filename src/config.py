@@ -47,8 +47,8 @@ class Setting:
 # `plain` is the client's name for the bare current sub-query, i0's style.
 SETTINGS = {
     # --- ITER, one per query representation ---
-    # Only the default (i7) is released; the ablation variants have to be
-    # trained with run_train.py, which writes to models/iter_<setting>.
+    # i7 is the released checkpoint; run_train.py trains the others into
+    # models/iter_<setting>.
     "i0": Setting(style="plain", max_length=512,  retriever="models/iter_i0"),
     "i1": Setting(style="i1",    max_length=8192, retriever="models/iter_i1"),
     "i2": Setting(style="i2",    max_length=8192, retriever="models/iter_i2"),
