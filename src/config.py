@@ -67,8 +67,7 @@ SETTINGS = {
                     retriever="Qwen/Qwen3-Embedding-0.6B"),
     "lrat": Setting(style="plain", max_length=512, dedup=False,
                     retriever="Yuqi-Zhou/LRAT-Qwen3-Embedding-0.6B"),
-    # AgentIR is served exactly as its model card specifies: its own
-    # instruction, and no trailing space after "Query:".
+    # AgentIR uses its own model card's instruction format.
     "agentir": Setting(
         style="i6", max_length=8192, dedup=False, retriever="Tevatron/AgentIR-4B",
         task_prefix_override=(
